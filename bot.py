@@ -1,20 +1,16 @@
-import discord
 import os
-from dotenv import load_dotenv
+import discord
 from discord import app_commands
 import sqlite3
 import random
 import urllib.parse
 
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
-GUILD_ID = int(os.getenv('GUILD_ID'))
-
-# --- 1. Database Setup ---
-def setup_db():
+# --- 1. Database & First-Time Setup ---
+def init_and_get_credentials():
     conn = sqlite3.connect('flex_roster.db')
     cursor = conn.cursor()
-    # Create the players table if it doesn't exist yet
+    
+    # Create tables if they don't exist
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS players (
             discord_id INTEGER PRIMARY KEY,
@@ -24,11 +20,45 @@ def setup_db():
             is_admin INTEGER
         )
     ''')
-    conn.commit()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS server_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT
+        )
+    ''')
+    
+    # Check if credentials already exist
+    cursor.execute("SELECT setting_value FROM server_settings WHERE setting_key = 'discord_token'")
+    token_row = cursor.fetchone()
+    cursor.execute("SELECT setting_value FROM server_settings WHERE setting_key = 'guild_id'")
+    guild_row = cursor.fetchone()
+    
+    # If they are missing, trigger the Setup Wizard
+    if not token_row or not guild_row:
+        print("=====================================")
+        print("  FLEX MATCHMAKER - FIRST TIME SETUP ")
+        print("=====================================")
+        print("No configuration found. Let's set up your bot!")
+        token = input("Enter your Discord Bot Token: ").strip()
+        guild = input("Enter your Server (Guild) ID: ").strip()
+        
+        cursor.execute("INSERT OR REPLACE INTO server_settings (setting_key, setting_value) VALUES ('discord_token', ?)", (token,))
+        cursor.execute("INSERT OR REPLACE INTO server_settings (setting_key, setting_value) VALUES ('guild_id', ?)", (guild,))
+        
+        # Set default region to EUW while we are here
+        cursor.execute("INSERT OR IGNORE INTO server_settings (setting_key, setting_value) VALUES ('region', 'euw')")
+        
+        conn.commit()
+        print("\nCredentials saved to database! Starting bot...\n")
+    else:
+        token = token_row[0]
+        guild = guild_row[0]
+        
     conn.close()
+    return token, int(guild)
 
-# Run the setup right away
-setup_db() 
+# Fetch the credentials securely from the local database
+TOKEN, GUILD_ID = init_and_get_credentials()
 
 # --- 2. Bot Setup ---
 class MyBot(discord.Client):
@@ -40,7 +70,6 @@ class MyBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
-        # PUT YOUR SERVER ID HERE
         MY_GUILD = discord.Object(id=GUILD_ID) 
         self.tree.copy_global_to(guild=MY_GUILD)
         await self.tree.sync(guild=MY_GUILD)
@@ -73,7 +102,6 @@ bot = MyBot()
     app_commands.Choice(name="Support", value="Support"),
     app_commands.Choice(name="Fill", value="Fill"),
 ])
-
 async def register(interaction: discord.Interaction, ign: str, primary: app_commands.Choice[str], secondary: app_commands.Choice[str]):
     
     # Check if the person using the command is a Discord Server Admin
@@ -94,7 +122,7 @@ async def register(interaction: discord.Interaction, ign: str, primary: app_comm
 
     # Reply to the user
     await interaction.response.send_message(
-        f"✅ Successfully registered **{ign}**!\n"
+        f"Successfully registered **{ign}**!\n"
         f"**Primary:** {primary.value} | **Secondary:** {secondary.value}"
     )
 
@@ -119,12 +147,31 @@ async def queue_manager(interaction: discord.Interaction, action: app_commands.C
     elif action.value == "view":
         await interaction.response.send_message(f"There are currently **{len(active_queue)}** players in queue.")
 
-# --- 5. Generate Team Algorithm ---
+# --- 5. Dynamic Region Setting ---
+@bot.tree.command(name="set_region", description="[ADMIN ONLY] Change the OP.GG region for the server")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.choices(region=[
+    app_commands.Choice(name="EU West (EUW)", value="euw"),
+    app_commands.Choice(name="North America (NA)", value="na"),
+    app_commands.Choice(name="EU Nordic & East (EUNE)", value="eune"),
+    app_commands.Choice(name="Korea (KR)", value="kr"),
+    app_commands.Choice(name="Oceania (OCE)", value="oce"),
+])
+async def set_region(interaction: discord.Interaction, region: app_commands.Choice[str]):
+    conn = sqlite3.connect('flex_roster.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE server_settings SET setting_value = ? WHERE setting_key = 'region'", (region.value,))
+    conn.commit()
+    conn.close()
+    
+    await interaction.response.send_message(f"OP.GG multi-search region successfully updated to **{region.name}**!")
+
+# --- 6. Generate Team Algorithm ---
 @bot.tree.command(name="generate_team", description="[ADMIN ONLY] Drafts a 5-man team from the queue")
 @app_commands.checks.has_permissions(administrator=True)
 async def generate_team(interaction: discord.Interaction):
     if len(active_queue) < 5:
-        await interaction.response.send_message(f"X Not enough players in queue! We need at least 5, but only have {len(active_queue)}.", ephemeral=True)
+        await interaction.response.send_message(f"Not enough players in queue! We need at least 5, but only have {len(active_queue)}.", ephemeral=True)
         return
 
     # 1. Fetch profiles of everyone in the queue from the database
@@ -133,11 +180,11 @@ async def generate_team(interaction: discord.Interaction):
     placeholders = ','.join('?' * len(active_queue))
     cursor.execute(f"SELECT discord_id, ign, primary_role, secondary_role, is_admin FROM players WHERE discord_id IN ({placeholders})", tuple(active_queue))
     queued_players = cursor.fetchall()
-    conn.close()
 
     # If someone in the queue never used /register, they won't be in the database
     if len(queued_players) < 5:
         await interaction.response.send_message("Some players in the queue haven't used `/register` yet!", ephemeral=True)
+        conn.close()
         return
 
     # 2. Separate Admins from Non-Admins
@@ -146,6 +193,7 @@ async def generate_team(interaction: discord.Interaction):
 
     if not admins:
         await interaction.response.send_message("No Admin-Leaders are currently in the queue! At least one must be queued.", ephemeral=True)
+        conn.close()
         return
 
     # 3. Draft the 5 players
@@ -191,17 +239,22 @@ async def generate_team(interaction: discord.Interaction):
     for player in still_unassigned:
         ign = player[1]
         forced_role = roles_needed.pop(0)
-        final_roster[forced_role] = f"! {ign} (Auto-Filled) !"
+        final_roster[forced_role] = f"⚠️ {ign} (Auto-Filled) ⚠️"
 
-    # 5. Generate OP.GG Link (Set to EUW based on your location)
+    # 5. Generate OP.GG Link (Dynamically fetch region from database)
+    cursor.execute("SELECT setting_value FROM server_settings WHERE setting_key = 'region'")
+    region = cursor.fetchone()[0]
+    conn.close()
+
     igns_only = [p[1] for p in selected_team]
     joined_igns = ','.join(igns_only)
+    
     # URL encode the IGNs (converts spaces and symbols so the web link works)
     encoded_igns = urllib.parse.quote_plus(joined_igns)
-    opgg_url = f"https://op.gg/lol/multisearch/euw?summoners={encoded_igns}"
+    opgg_url = f"https://op.gg/lol/multisearch/{region}?summoners={encoded_igns}"
 
     # 6. Format the Discord Message
-    embed = discord.Embed(title="🎮 Flex Team Drafted!", color=discord.Color.green())
+    embed = discord.Embed(title="Flex Team Drafted!", color=discord.Color.green())
     embed.add_field(name="Top", value=final_roster.get("Top", "Missing"), inline=False)
     embed.add_field(name="Jungle", value=final_roster.get("Jungle", "Missing"), inline=False)
     embed.add_field(name="Mid", value=final_roster.get("Mid", "Missing"), inline=False)

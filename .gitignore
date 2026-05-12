@@ -1,4 +1,6 @@
-.env
 flex_roster.db
 __pycache__/
 venv/
+build/
+dist/
+*.spec
