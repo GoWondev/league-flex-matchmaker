@@ -1,0 +1,4 @@
+.env
+flex_roster.db
+__pycache__/
+venv/
